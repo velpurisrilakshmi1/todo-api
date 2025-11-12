@@ -14,15 +14,25 @@ from jose import JWTError, jwt             # For JWT token creation and verifica
 import logging                             # For application logging
 import re                                  # For regex pattern matching
 
-# Import configuration
+# Import configuration and error handling
 from config import settings, validate_settings
-
-# Configure logging
-logging.basicConfig(
-    level=logging.INFO if settings.debug else logging.WARNING,
-    format="%(asctime)s - %(name)s - %(levelname)s - %(message)s"
+from logging_config import setup_logging, get_logger, log_security_event
+from error_handling import (
+    setup_error_handlers, raise_not_found, raise_validation_error,
+    raise_conflict_error, raise_auth_error, AuthenticationError,
+    NotFoundError, ValidationError, ConflictError
 )
-logger = logging.getLogger(__name__)
+from middleware import (
+    RequestLoggingMiddleware, SecurityMiddleware, 
+    RateLimitMiddleware, HealthCheckMiddleware
+)
+
+# Setup logging system
+setup_logging()
+
+# Track application start time for health monitoring
+app_start_time = datetime.utcnow()
+logger = get_logger("todo_api")
 
 # Validate configuration on startup
 validate_settings()
@@ -409,12 +419,6 @@ async def authenticate_user(username: str, password: str) -> Optional[User]:
 
 async def get_current_user(credentials: HTTPAuthorizationCredentials = Depends(security)) -> User:
     """Get current authenticated user from JWT token"""
-    # Define the exception to raise if authentication fails
-    credentials_exception = HTTPException(
-        status_code=status.HTTP_401_UNAUTHORIZED,
-        detail="Could not validate credentials",
-        headers={"WWW-Authenticate": "Bearer"},
-    )
     
     try:
         # Decode the JWT token to get the payload
@@ -423,20 +427,30 @@ async def get_current_user(credentials: HTTPAuthorizationCredentials = Depends(s
         # Extract username from token (stored in "sub" field)
         username: str = payload.get("sub")
         if username is None:
-            raise credentials_exception
+            raise_auth_error("Invalid token: missing username")
             
         # Create token data object
         token_data = TokenData(username=username)
         
-    except JWTError:
+    except JWTError as e:
         # Token is invalid (expired, malformed, wrong signature)
-        raise credentials_exception
+        log_security_event(
+            event_type="INVALID_JWT_TOKEN",
+            details={"error": str(e), "token_preview": credentials.credentials[:20] + "..."},
+            severity="WARNING"
+        )
+        raise_auth_error("Invalid or expired token")
     
     # Get user from database using username from token
     user = await get_user_by_username(username=token_data.username)
     if user is None:
         # User no longer exists in database
-        raise credentials_exception
+        log_security_event(
+            event_type="USER_NOT_FOUND_FOR_TOKEN",
+            details={"username": username},
+            severity="WARNING"
+        )
+        raise_auth_error("User not found")
         
     return user  # Return authenticated user
 
@@ -461,6 +475,23 @@ app = FastAPI(
     debug=settings.debug,                                       # Debug mode from settings
     lifespan=lifespan                                          # Attach startup/shutdown handler
 )
+
+# Setup error handlers
+setup_error_handlers(app)
+
+# Add middleware (order matters - first added is executed last)
+# Testing middleware one by one
+app.add_middleware(RequestLoggingMiddleware)
+# app.add_middleware(SecurityMiddleware)
+# app.add_middleware(RateLimitMiddleware, requests_per_minute=settings.rate_limit_per_minute)
+# app.add_middleware(HealthCheckMiddleware)  # Health monitoring
+
+# Create health check middleware instance for stats access
+health_middleware = None
+for middleware in app.user_middleware:
+    if isinstance(middleware.cls, type) and issubclass(middleware.cls, HealthCheckMiddleware):
+        # We'll access health stats through the endpoint instead
+        break
 
 # Add CORS middleware
 app.add_middleware(
@@ -600,9 +631,25 @@ async def delete_todo(todo_id: str, current_user: User = Depends(get_current_use
 # HEALTH CHECK ENDPOINT - GET /health
 @app.get("/health")
 async def health_check():
-    """Health check endpoint - used to verify if the API is running properly"""
-    # Simple endpoint that returns a status - useful for monitoring tools
-    return {"status": "healthy"}
+    """Enhanced health check endpoint with system stats"""
+    try:
+        # Test database connection
+        async with aiosqlite.connect(DATABASE_PATH) as db:
+            await db.execute("SELECT 1")
+            database_status = "healthy"
+    except Exception as e:
+        logger.error(f"Database health check failed: {e}")
+        database_status = "unhealthy"
+    
+    return {
+        "status": "healthy" if database_status == "healthy" else "unhealthy",
+        "timestamp": datetime.utcnow().isoformat() + "Z",
+        "version": settings.api_version,
+        "environment": settings.environment,
+        "database": database_status,
+        "uptime_seconds": (datetime.utcnow() - app_start_time).total_seconds(),
+        "message": "Todo API is running"
+    }
 
 # DIRECT EXECUTION (if you run this file directly with python main.py)
 if __name__ == "__main__":

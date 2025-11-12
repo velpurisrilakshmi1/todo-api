@@ -1,0 +1,89 @@
+version: '3.8'
+
+services:
+  # Todo API Application
+  todo-api:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: todo-api-prod
+    ports:
+      - "8000:8000"
+    environment:
+      # Override environment variables for production
+      - ENVIRONMENT=production
+      - DEBUG=false
+      - DATABASE_URL=sqlite:///./data/todos.db
+      - SECRET_KEY=${SECRET_KEY:-production-secret-key-change-this}
+      - CORS_ORIGINS=["http://localhost:3000","https://yourdomain.com"]
+    volumes:
+      # Persist database and logs
+      - todo_data:/app/data
+      - todo_logs:/app/logs
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8000/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 40s
+    labels:
+      - "traefik.enable=true"
+      - "traefik.http.routers.todo-api.rule=Host(`api.yourdomain.com`)"
+      - "traefik.http.routers.todo-api.tls=true"
+      - "traefik.http.routers.todo-api.tls.certresolver=letsencrypt"
+
+  # Nginx Reverse Proxy (Optional)
+  nginx:
+    image: nginx:alpine
+    container_name: todo-nginx
+    ports:
+      - "80:80"
+      - "443:443"
+    volumes:
+      - ./nginx.conf:/etc/nginx/nginx.conf:ro
+      - ./ssl:/etc/nginx/ssl:ro
+    depends_on:
+      - todo-api
+    restart: unless-stopped
+
+  # PostgreSQL Database (Production Alternative)
+  postgres:
+    image: postgres:15-alpine
+    container_name: todo-postgres
+    environment:
+      - POSTGRES_DB=todoapi
+      - POSTGRES_USER=todouser
+      - POSTGRES_PASSWORD=${POSTGRES_PASSWORD:-secure-password-change-this}
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+      - ./init.sql:/docker-entrypoint-initdb.d/init.sql
+    ports:
+      - "5432:5432"
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U todouser -d todoapi"]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+
+  # Redis for Caching/Rate Limiting (Optional)
+  redis:
+    image: redis:7-alpine
+    container_name: todo-redis
+    ports:
+      - "6379:6379"
+    volumes:
+      - redis_data:/data
+    restart: unless-stopped
+    command: redis-server --appendonly yes --requirepass ${REDIS_PASSWORD:-redis-password}
+
+volumes:
+  todo_data:
+  todo_logs:
+  postgres_data:
+  redis_data:
+
+networks:
+  default:
+    name: todo-network
