@@ -1,0 +1,46 @@
+[tool.pytest.ini_options]
+minversion = "6.0"
+addopts = "-ra -q --tb=short"
+testpaths = [
+    "tests",
+    ".",
+]
+python_files = [
+    "test_*.py",
+    "*_test.py",
+]
+python_classes = [
+    "Test*",
+]
+python_functions = [
+    "test_*",
+]
+asyncio_mode = "auto"
+
+# Markers for organizing tests
+markers = [
+    "auth: Authentication related tests",
+    "crud: CRUD operation tests", 
+    "validation: Input validation tests",
+    "security: Security related tests",
+    "slow: Tests that take a long time to run",
+]
+
+# Test coverage settings
+[tool.coverage.run]
+source = ["."]
+omit = [
+    "test_*.py",
+    "*_test.py",
+    "venv/*",
+    ".venv/*",
+    "*/site-packages/*",
+]
+
+[tool.coverage.report]
+exclude_lines = [
+    "pragma: no cover",
+    "def __repr__",
+    "raise AssertionError",
+    "raise NotImplementedError",
+]

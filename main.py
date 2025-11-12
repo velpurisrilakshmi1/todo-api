@@ -1,26 +1,36 @@
 # Import necessary libraries for our FastAPI application
 from fastapi import FastAPI, HTTPException, Depends, status  # FastAPI framework and HTTP exception handling
 from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials  # For JWT authentication
+from fastapi.middleware.cors import CORSMiddleware  # For CORS handling
 from pydantic import BaseModel              # For data validation and serialization
 from typing import List, Optional           # Type hints for better code readability
 import uuid                                 # Generate unique IDs for todos
 import aiosqlite                           # Async SQLite database operations
-import os                                  # Operating system interface (not used but good to have)
+import os                                  # Operating system interface
 from contextlib import asynccontextmanager  # For managing application startup/shutdown
 from datetime import datetime, timedelta   # For JWT token expiration
 from passlib.context import CryptContext   # For password hashing
 from jose import JWTError, jwt             # For JWT token creation and verification
+import logging                             # For application logging
+import re                                  # For regex pattern matching
+
+# Import configuration
+from config import settings, validate_settings
+
+# Configure logging
+logging.basicConfig(
+    level=logging.INFO if settings.debug else logging.WARNING,
+    format="%(asctime)s - %(name)s - %(levelname)s - %(message)s"
+)
+logger = logging.getLogger(__name__)
+
+# Validate configuration on startup
+validate_settings()
 
 # Database configuration
 DATABASE_PATH = "todos.db"  # SQLite database file name (will be created automatically)
 
-# AUTHENTICATION CONFIGURATION
-SECRET_KEY = "your-super-secret-key-change-this-in-production"  # JWT secret key (change in production!)
-ALGORITHM = "HS256"                    # JWT algorithm
-ACCESS_TOKEN_EXPIRE_MINUTES = 30       # Token expires after 30 minutes
-
-# Password hashing configuration
-# Simple bcrypt configuration for secure password hashing
+# Password hashing configuration using settings
 pwd_context = CryptContext(schemes=["bcrypt"], deprecated="auto")
 
 # HTTP Bearer token security
@@ -56,6 +66,11 @@ class UserCreate(UserBase):
     """Model for user registration (includes password)"""
     password: str                       # Plain text password (will be hashed before storing)
 
+class UserLogin(BaseModel):
+    """Model for user login (username and password only)"""
+    username: str                       # Username for login
+    password: str                       # Password for login
+
 class UserResponse(UserBase):
     """Model for user data in API responses (no password!)"""
     id: str                            # Unique user identifier
@@ -75,6 +90,59 @@ class Token(BaseModel):
 class TokenData(BaseModel):
     """Data extracted from JWT token"""
     username: Optional[str] = None     # Username from token payload
+
+# INPUT VALIDATION FUNCTIONS
+def validate_password_strength(password: str) -> None:
+    """Validate password meets security requirements"""
+    if len(password) < settings.min_password_length:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=f"Password must be at least {settings.min_password_length} characters long"
+        )
+    
+    # Check for at least one number
+    if not re.search(r"\d", password):
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Password must contain at least one number"
+        )
+    
+    # Check for at least one letter
+    if not re.search(r"[a-zA-Z]", password):
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Password must contain at least one letter"
+        )
+
+def validate_email_format(email: str) -> None:
+    """Validate email format"""
+    email_pattern = r'^[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}$'
+    if not re.match(email_pattern, email):
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Invalid email format"
+        )
+
+def validate_username(username: str) -> None:
+    """Validate username format"""
+    if len(username) < 3:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Username must be at least 3 characters long"
+        )
+    
+    if len(username) > 50:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Username must be less than 50 characters"
+        )
+    
+    # Only allow alphanumeric characters and underscores
+    if not re.match(r'^[a-zA-Z0-9_]+$', username):
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Username can only contain letters, numbers, and underscores"
+        )
 
 # PASSWORD & JWT UTILITY FUNCTIONS
 # These functions handle password hashing and JWT token operations
@@ -104,7 +172,7 @@ def create_access_token(data: dict, expires_delta: Optional[timedelta] = None) -
     to_encode.update({"exp": expire})
     
     # Create and return the JWT token
-    encoded_jwt = jwt.encode(to_encode, SECRET_KEY, algorithm=ALGORITHM)
+    encoded_jwt = jwt.encode(to_encode, settings.secret_key, algorithm=settings.algorithm)
     return encoded_jwt
 
 # DATABASE FUNCTIONS
@@ -350,7 +418,7 @@ async def get_current_user(credentials: HTTPAuthorizationCredentials = Depends(s
     
     try:
         # Decode the JWT token to get the payload
-        payload = jwt.decode(credentials.credentials, SECRET_KEY, algorithms=[ALGORITHM])
+        payload = jwt.decode(credentials.credentials, settings.secret_key, algorithms=[settings.algorithm])
         
         # Extract username from token (stored in "sub" field)
         username: str = payload.get("sub")
@@ -387,10 +455,20 @@ async def lifespan(app: FastAPI):
 
 # CREATE FASTAPI APPLICATION INSTANCE
 app = FastAPI(
-    title="Todo API",                                           # API title (shown in docs)
-    description="A simple Todo API built with FastAPI and SQLite",  # API description
-    version="2.0.0",                                           # API version
+    title=settings.api_title,                                   # API title from settings
+    description=settings.api_description,                       # API description from settings
+    version=settings.api_version,                               # API version from settings
+    debug=settings.debug,                                       # Debug mode from settings
     lifespan=lifespan                                          # Attach startup/shutdown handler
+)
+
+# Add CORS middleware
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=settings.cors_origins,
+    allow_credentials=settings.cors_allow_credentials,
+    allow_methods=["GET", "POST", "PUT", "DELETE"],
+    allow_headers=["*"],
 )
 
 # API ENDPOINTS (Routes)
@@ -408,10 +486,18 @@ async def root():
 # REGISTER NEW USER - POST /register
 @app.post("/register", response_model=UserResponse)
 async def register(user: UserCreate):
-    """Register a new user account"""
-    # Validate input data (automatic with Pydantic)
+    """Register a new user account with validation"""
+    logger.info(f"Registration attempt for username: {user.username}")
+    
+    # Validate input data
+    validate_username(user.username)
+    validate_email_format(user.email)
+    validate_password_strength(user.password)
+    
     # Create user in database (will throw error if username/email exists)
     db_user = await create_user_in_db(user)
+    
+    logger.info(f"Successfully registered user: {user.username}")
     
     # Return user data (without password!) 
     return UserResponse(
@@ -423,7 +509,7 @@ async def register(user: UserCreate):
 
 # USER LOGIN - POST /login
 @app.post("/login", response_model=Token)
-async def login(user_credentials: UserCreate):
+async def login(user_credentials: UserLogin):
     """Login user and return JWT access token"""
     # Authenticate user with username and password
     user = await authenticate_user(user_credentials.username, user_credentials.password)
@@ -437,7 +523,7 @@ async def login(user_credentials: UserCreate):
         )
     
     # Create JWT access token
-    access_token_expires = timedelta(minutes=ACCESS_TOKEN_EXPIRE_MINUTES)
+    access_token_expires = timedelta(minutes=settings.access_token_expire_minutes)
     access_token = create_access_token(
         data={"sub": user.username},  # "sub" is standard JWT claim for subject (user)
         expires_delta=access_token_expires
@@ -475,7 +561,7 @@ async def get_todo(todo_id: str, current_user: User = Depends(get_current_user))
     return todo
 
 # CREATE NEW TODO - POST /todos (Protected)
-@app.post("/todos", response_model=Todo)
+@app.post("/todos", response_model=Todo, status_code=status.HTTP_201_CREATED)
 async def create_todo(todo: TodoCreate, current_user: User = Depends(get_current_user)):
     """Create a new todo for the authenticated user in database"""
     # The todo parameter automatically validates the request body against TodoCreate model
